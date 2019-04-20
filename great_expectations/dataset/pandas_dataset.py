@@ -73,7 +73,7 @@ class MetaPandasDataset(Dataset):
             if func.__name__ in ['expect_column_values_to_not_be_null', 'expect_column_values_to_be_null']:
                 ignore_values = []
 
-            series = self[column]
+            series = self.df[column]
 
             # FIXME rename to mapped_ignore_values?
             if len(ignore_values) == 0:
@@ -140,8 +140,8 @@ class MetaPandasDataset(Dataset):
             if result_format is None:
                 result_format = self.default_expectation_args["result_format"]
 
-            series_A = self[column_A]
-            series_B = self[column_B]
+            series_A = self.df[column_A]
+            series_B = self.df[column_B]
 
             if ignore_row_if == "both_values_are_missing":
                 boolean_mapped_null_values = series_A.isnull() & series_B.isnull()
@@ -214,7 +214,7 @@ class MetaPandasDataset(Dataset):
             if result_format is None:
                 result_format = self.default_expectation_args["result_format"]
 
-            test_df = self[column_list]
+            test_df = self.df[column_list]
 
             if ignore_row_if == "all_values_are_missing":
                 boolean_mapped_skip_values = test_df.isnull().all(axis=1)
