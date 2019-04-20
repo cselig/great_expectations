@@ -21,10 +21,13 @@ elif sys.version_info.major == 3:  # If python 3
 
 from .dataset import Dataset
 from great_expectations.data_asset.util import DocInherit, parse_result_format
-from great_expectations.dataset.util import \
-    is_valid_partition_object, is_valid_categorical_partition_object, is_valid_continuous_partition_object, \
-    _scipy_distribution_positional_args_from_dict, validate_distribution_parameters
-
+from great_expectations.dataset.util import (
+    is_valid_partition_object,
+    is_valid_categorical_partition_object,
+    is_valid_continuous_partition_object,
+    _scipy_distribution_positional_args_from_dict,
+    validate_distribution_parameters,
+)
 
 class MetaPandasDataset(Dataset):
     """MetaPandasDataset is a thin layer between Dataset and PandasDataset.
@@ -248,9 +251,10 @@ class MetaPandasDataset(Dataset):
         return inner_wrapper
 
 
-class PandasDataset(MetaPandasDataset, pd.DataFrame):
+class PandasDataset(MetaPandasDataset):
     """
-    PandasDataset instantiates the great_expectations Expectations API as a subclass of a pandas.DataFrame.
+    PandasDataset instantiates the great_expectations Expectations API. This class holds an attribute
+    `df` which is a Pandas dataframe. Construction of this dataframe is done outside this class.
 
     For the full API reference, please see :func:`Dataset <great_expectations.data_asset.dataset.Dataset>`
 
@@ -262,114 +266,49 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
            is performed by default).
     """
 
-    # We may want to expand or alter support for subclassing dataframes in the future:
-    # See http://pandas.pydata.org/pandas-docs/stable/extending.html#extending-subclassing-pandas
-
-    @property
-    def _constructor(self):
-        return self.__class__
-
-    def __finalize__(self, other, method=None, **kwargs):
-        if isinstance(other, PandasDataset):
-            self._initialize_expectations(other.get_expectations_config(
-                discard_failed_expectations=False,
-                discard_result_format_kwargs=False,
-                discard_include_configs_kwargs=False,
-                discard_catch_exceptions_kwargs=False))
-            # If other was coerced to be a PandasDataset (e.g. via _constructor call during self.copy() operation)
-            # then it may not have discard_subset_failing_expectations set. Default to self value
-            self.discard_subset_failing_expectations = getattr(other, "discard_subset_failing_expectations",
-                                                               self.discard_subset_failing_expectations)
-            if self.discard_subset_failing_expectations:
-                self.discard_failing_expectations()
-        super(PandasDataset, self).__finalize__(other, method, **kwargs)
-        return self
-
-    def __init__(self, *args, **kwargs):
+    def __init__(self, df, *args, **kwargs):
         super(PandasDataset, self).__init__(*args, **kwargs)
+        self.df = df
         self.discard_subset_failing_expectations = kwargs.get(
             'discard_subset_failing_expectations', False)
 
     def _get_row_count(self):
-        return self.shape[0]
+        return self.df.shape[0]
+
+    def _get_table_columns(self):
+        return list(self.df.columns)
 
     def _get_column_sum(self, column):
-        return self[column].sum()
+        return self.df[column].sum()
 
     def _get_column_max(self, column):
-        return self[column].max()
+        return self.df[column].max()
 
     def _get_column_min(self, column):
-        return self[column].min()
+        return self.df[column].min()
 
     def _get_column_mean(self, column):
-        return self[column].mean()
+        return self.df[column].mean()
 
     def _get_column_nonnull_count(self, column):
-        series = self[column]
+        series = self.df[column]
         null_indexes = series.isnull()
         nonnull_values = series[null_indexes == False]
         return len(nonnull_values)
 
     def _get_column_value_counts(self, column):
-        return self[column].value_counts()
+        return self.df[column].value_counts()
 
     def _get_column_unique_count(self, column):
-        return self.column_value_counts[column].shape[0]
+        return self.df.column_value_counts[column].shape[0]
 
     def _get_column_modes(self, column):
-        return list(self[column].mode().values)
+        return list(self.df[column].mode().values)
 
     def _get_column_median(self, column):
-        return self[column].median()
+        return self.df[column].median()
 
     ### Expectation methods ###
-    @DocInherit
-    @Dataset.expectation(['column'])
-    def expect_column_to_exist(
-            self, column, column_index=None, result_format=None, include_config=False,
-            catch_exceptions=None, meta=None
-    ):
-
-        if column in self:
-            return {
-                "success": (column_index is None) or (self.columns.get_loc(column) == column_index)
-            }
-
-        else:
-            return {
-                "success": False
-            }
-
-    @DocInherit
-    @Dataset.expectation(['column_list'])
-    def expect_table_columns_to_match_ordered_list(self, column_list,
-                                                  result_format=None, include_config=False, catch_exceptions=None, meta=None):
-        """
-        Checks if observed columns are in the expected order. The expectations will fail if columns are out of expected
-        order, columns are missing, or additional columns are present. On failure, details are provided on the location
-        of the unexpected column(s).
-        """
-        if list(self.columns) == list(column_list):
-            return {
-                "success": True
-            }
-        else:
-            # In the case of differing column lengths between the defined expectation and the observed column set, the
-            # max is determined to generate the column_index.
-            number_of_columns = max(len(column_list), len(self.columns))
-            column_index = range(number_of_columns)
-
-            # Create a list of the mismatched details
-            compared_lists = list(zip_longest(column_index, list(column_list), list(self.columns)))
-            mismatched = [{"Expected Column Position": i,
-                           "Expected": k,
-                           "Found": v} for i, k, v in compared_lists if k != v]
-            return {
-                "success": False,
-                "details": {"mismatched": mismatched}
-            }
-
     @DocInherit
     @MetaPandasDataset.column_map_expectation
     def expect_column_values_to_be_unique(self, column,
