@@ -15,38 +15,10 @@ from pyspark.sql import SparkSession
 import pyspark.sql.types as sparktypes
 
 from great_expectations.dataset import PandasDataset, SqlAlchemyDataset, SparkDFDataset
+from great_expectations.dataset.util import Datasets
 import great_expectations.dataset.autoinspect as autoinspect
+from great_expectations.util import types
 
-SQLITE_TYPES = {
-        "varchar": sqlitetypes.VARCHAR,
-        "char": sqlitetypes.CHAR,
-        "int": sqlitetypes.INTEGER,
-        "smallint": sqlitetypes.SMALLINT,
-        "datetime": sqlitetypes.DATETIME(truncate_microseconds=True),
-        "date": sqlitetypes.DATE,
-        "float": sqlitetypes.FLOAT,
-        "bool": sqlitetypes.BOOLEAN
-}
-
-POSTGRESQL_TYPES = {
-        "text": postgresqltypes.TEXT,
-        "char": postgresqltypes.CHAR,
-        "int": postgresqltypes.INTEGER,
-        "smallint": postgresqltypes.SMALLINT,
-        "timestamp": postgresqltypes.TIMESTAMP,
-        "date": postgresqltypes.DATE,
-        "float": postgresqltypes.FLOAT,
-        "bool": postgresqltypes.BOOLEAN
-}
-
-SPARK_TYPES = {
-    "string": sparktypes.StringType,
-    "int": sparktypes.IntegerType,
-    "date": sparktypes.DateType,
-    "timestamp": sparktypes.TimestampType,
-    "float": sparktypes.DoubleType,
-    "bool": sparktypes.BooleanType,
-}
 
 # Taken from the following stackoverflow:
 # https://stackoverflow.com/questions/23549419/assert-that-two-dictionaries-are-almost-equal
@@ -102,7 +74,7 @@ def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.c
     if dataset_type == 'PandasDataset':
         df = pd.DataFrame(data)
         if schemas and "pandas" in schemas:
-            pandas_schema = {key:np.dtype(value) for (key, value) in schemas["pandas"].items()}
+            pandas_schema = types.get_schema(schemas['pandas'], Datasets.PANDAS)
             df = df.astype(pandas_schema)
         return PandasDataset(df, autoinspect_func=autoinspect_func)
     elif dataset_type == 'SqlAlchemyDataset':
@@ -123,7 +95,7 @@ def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.c
         sql_dtypes = {}
         if schemas and "sqlite" in schemas and isinstance(engine.dialect, sqlitetypes.dialect):
             schema = schemas["sqlite"]
-            sql_dtypes = {col : SQLITE_TYPES[dtype] for (col,dtype) in schema.items()}
+            sql_dtypes = {col : types.SQLITE_TYPES[dtype] for (col,dtype) in schema.items()}
             for col in schema:
                 type = schema[col]
                 if type == "int":
@@ -134,7 +106,7 @@ def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.c
                     df[col] = pd.to_datetime(df[col])
         elif schemas and "postgresql" in schemas and isinstance(engine.dialect, postgresqltypes.dialect):
             schema = schemas["postgresql"]
-            sql_dtypes = {col : POSTGRESQL_TYPES[dtype] for (col, dtype) in schema.items()}
+            sql_dtypes = {col : types.POSTGRESQL_TYPES[dtype] for (col, dtype) in schema.items()}
             for col in schema:
                 type = schema[col]
                 if type == "int":
@@ -155,10 +127,7 @@ def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.c
         data_reshaped = list(zip(*[v for _, v in data.items()]))
         if schemas and 'spark' in schemas:
             schema = schemas['spark']
-            spark_schema = sparktypes.StructType([
-                sparktypes.StructField(column, SPARK_TYPES[schema[column]]())
-                for column in schema
-            ])
+            spark_schema = types.get_schema(schemas['spark'], Datasets.SPARK)
             spark_df = spark.createDataFrame(data_reshaped, spark_schema)
         else:
             # if no schema provided, uses Spark's schema inference

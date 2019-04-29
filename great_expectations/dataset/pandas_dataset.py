@@ -21,6 +21,7 @@ elif sys.version_info.major == 3:  # If python 3
 
 from .dataset import Dataset
 from great_expectations.data_asset.util import DocInherit, parse_result_format
+from great_expectations.util import types
 from great_expectations.dataset.util import \
     is_valid_partition_object, is_valid_categorical_partition_object, is_valid_continuous_partition_object, \
     _scipy_distribution_positional_args_from_dict, validate_distribution_parameters
@@ -383,19 +384,7 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
     def expect_column_values_to_be_of_type(self, column, type_,
                                            mostly=None,
                                            result_format=None, include_config=False, catch_exceptions=None, meta=None):
-
-        # Target Datasource {numpy, python} was removed in favor of a simpler type mapping
-        type_map = {
-            "null": [type(None), np.nan],
-            "boolean": [bool, np.bool_],
-            "int": [int, np.int64] + list(integer_types),
-            "long": [int, np.longdouble] + list(integer_types),
-            "float": [float, np.float_],
-            "double": [float, np.longdouble],
-            "bytes": [bytes, np.bytes_],
-            "string": [string_types, np.string_]
-        }
-
+        type_map = types.PYTHON_NP_TYPES
         target_type = type_map[type_]
 
         return column.map(lambda x: isinstance(x, tuple(target_type)))
@@ -405,18 +394,7 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
     def expect_column_values_to_be_in_type_list(self, column, type_list,
                                                 mostly=None,
                                                 result_format=None, include_config=False, catch_exceptions=None, meta=None):
-        # Target Datasource {numpy, python} was removed in favor of a simpler type mapping
-        type_map = {
-            "null": [type(None), np.nan],
-            "boolean": [bool, np.bool_],
-            "int": [int, np.int64] + list(integer_types),
-            "long": [int, np.longdouble] + list(integer_types),
-            "float": [float, np.float_],
-            "double": [float, np.longdouble],
-            "bytes": [bytes, np.bytes_],
-            "string": [string_types, np.string_]
-        }
-
+        type_map = types.PYTHON_NP_TYPES
         # Build one type list with each specified type list from type_map
         target_type_list = list()
         for type_ in type_list:

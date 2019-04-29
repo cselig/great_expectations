@@ -8,6 +8,11 @@ import numpy as np
 import warnings
 
 
+class Datasets:
+    PANDAS = 'pandas'
+    SPARK = 'spark'
+    SQL = 'sql'
+
 def is_valid_partition_object(partition_object):
     """Tests whether a given object is a valid continuous or categorical partition object.
     :param partition_object: The partition_object to evaluate
