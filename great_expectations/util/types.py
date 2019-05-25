@@ -52,6 +52,8 @@ SPARK_TYPES = {
     "timestamp": sparktypes.TimestampType,
     "float": sparktypes.DoubleType,
     "bool": sparktypes.BooleanType,
+    "object": sparktypes.DataType,
+    "null": sparktypes.NullType
 }
 
 def get_schema(schema, type):

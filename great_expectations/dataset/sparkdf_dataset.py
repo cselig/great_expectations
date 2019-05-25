@@ -1,10 +1,12 @@
 from __future__ import division
 
-from six import PY3
 import inspect
 import re
+import logging
+from six import PY3, string_types
 from functools import wraps
 from datetime import datetime
+from dateutil.parser import parse
 
 from .dataset import Dataset
 from great_expectations.data_asset.util import DocInherit, parse_result_format
@@ -17,8 +19,15 @@ from great_expectations.dataset.util import (
 import pandas as pd
 import numpy as np
 from scipy import stats
-from pyspark.sql.functions import udf, col, stddev as stddev_
 
+logger = logging.getLogger(__name__)
+
+try:
+    from pyspark.sql.functions import udf, col, stddev as stddev_
+    import pyspark.sql.types as sparktypes
+except ImportError:
+    logger.error("Unable to load spark context; install optional spark dependency for support.")
+    raise
 
 class MetaSparkDFDataset(Dataset):
     """MetaSparkDFDataset is a thin layer between Dataset and SparkDFDataset.
@@ -75,14 +84,13 @@ class MetaSparkDFDataset(Dataset):
 
             # a couple of tests indicate that caching here helps performance
             col_df.cache()
-            # this value is cached by SparkDFDataset
-            element_count = self.row_count
+            element_count = self.get_row_count()
 
             # FIXME temporary fix for missing/ignored value
             if func.__name__ not in ['expect_column_values_to_not_be_null', 'expect_column_values_to_be_null']:
                 col_df = col_df.filter('{column} is not null'.format(column=column))
                 # these nonnull_counts are cached by SparkDFDataset
-                nonnull_count = self.column_nonnull_counts[column]
+                nonnull_count = self.get_column_nonnull_count(column)
             else:
                 nonnull_count = element_count
 
@@ -126,8 +134,9 @@ class MetaSparkDFDataset(Dataset):
                 success,
                 element_count,
                 nonnull_count,
+                unexpected_count,
                 maybe_limited_unexpected_list,
-                unexpected_count=unexpected_count,
+                unexpected_index_list=None,
             )
 
             # FIXME Temp fix for result format
@@ -159,16 +168,16 @@ class SparkDFDataset(MetaSparkDFDataset):
         # Creation of the Spark Dataframe is done outside this class
         self.spark_df = spark_df
 
-    def _get_row_count(self):
+    def get_row_count(self):
         return self.spark_df.count()
 
-    def _get_table_columns(self):
+    def get_table_columns(self):
         return self.spark_df.columns
 
-    def _get_column_nonnull_count(self, column):
+    def get_column_nonnull_count(self, column):
         return self.spark_df.filter('{column} is not null'.format(column=column)).count()
 
-    def _get_column_mean(self, column):
+    def get_column_mean(self, column):
         # TODO need to apply this logic to other such methods?
         types = dict(self.spark_df.dtypes)
         if types[column] not in ('int', 'float', 'double'):
@@ -176,16 +185,28 @@ class SparkDFDataset(MetaSparkDFDataset):
         result = self.spark_df.select(column).groupBy().mean().collect()[0]
         return result[0] if len(result) > 0 else None
 
-    def _get_column_sum(self, column):
+    def get_column_sum(self, column):
         return self.spark_df.select(column).groupBy().sum().collect()[0][0]
 
-    def _get_column_max(self, column):
-        return self.spark_df.select(column).groupBy().max().collect()[0][0]
+    def get_column_max(self, column, parse_strings_as_datetimes=False):
+        temp_column = self.spark_df.select(column).where(col(column).isNotNull())
+        if parse_strings_as_datetimes:
+            temp_column = self._apply_dateutil_parse(temp_column)
+        result = temp_column.agg({column: 'max'}).collect()
+        if not result or not result[0]:
+            return None
+        return result[0][0]
 
-    def _get_column_min(self, column):
-        return self.spark_df.select(column).groupBy().min().collect()[0][0]
+    def get_column_min(self, column, parse_strings_as_datetimes=False):
+        temp_column = self.spark_df.select(column).where(col(column).isNotNull())
+        if parse_strings_as_datetimes:
+            temp_column = self._apply_dateutil_parse(temp_column)
+        result = temp_column.agg({column: 'min'}).collect()
+        if not result or not result[0]:
+            return None
+        return result[0][0]
 
-    def _get_column_value_counts(self, column):
+    def get_column_value_counts(self, column):
         value_counts = self.spark_df.select(column)\
             .filter('{} is not null'.format(column))\
             .groupBy(column)\
@@ -200,22 +221,66 @@ class SparkDFDataset(MetaSparkDFDataset):
             name=column,
         )
 
-    def _get_column_unique_count(self, column):
-        return self.column_value_counts[column].shape[0]
+    def get_column_unique_count(self, column):
+        return self.get_column_value_counts(column).shape[0]
 
-    def _get_column_modes(self, column):
+    def get_column_modes(self, column):
         """leverages computation done in _get_column_value_counts"""
-        s = self.column_value_counts[column]
+        s = self.get_column_value_counts(column)
         return list(s[s == s.max()].index)
 
-    def _get_column_median(self, column):
+    def get_column_median(self, column):
         # TODO this doesn't actually work e.g. median([1, 2, 3, 4]) -> 2.0
+        raise NotImplementedError
         result = self.spark_df.approxQuantile(column, [0.5], 0)
         return result[0] if len(result) > 0 else None
 
-    def _get_column_stdev(self, column):
+    def get_column_stdev(self, column):
         return self.spark_df.select(stddev_(col(column))).collect()[0][0]
 
+    def get_column_hist(self, column, bins):
+        """return a list of counts corresponding to bins"""
+        hist = []
+        for i in range(0, len(bins) - 1):
+            # all bins except last are half-open
+            if i == len(bins) - 2:
+                max_strictly = False
+            else:
+                max_strictly = True
+            hist.append(
+                self.get_column_count_in_range(column, min_val=bins[i], max_val=bins[i + 1], max_strictly=max_strictly)
+            )
+        return hist
+
+    def get_column_count_in_range(self, column, min_val=None, max_val=None, min_strictly=False, max_strictly=True):
+        # TODO this logic could probably go in the non-underscore version if we want to cache
+        if min_val is None and max_val is None:
+            raise ValueError('Must specify either min or max value')
+        if min_val is not None and max_val is not None and min_val > max_val:
+            raise ValueError('Min value must be <= to max value')
+
+        result = self.spark_df.select(column)
+        if min_val is not None:
+            if min_strictly:
+                result = result.filter(col(column) > min_val)
+            else:
+                result = result.filter(col(column) >= min_val)
+        if max_val is not None:
+            if max_strictly:
+                result = result.filter(col(column) < max_val)
+            else:
+                result = result.filter(col(column) <= max_val)
+        return result.count()
+
+    # Utils
+    @staticmethod
+    def _apply_dateutil_parse(column):
+        assert len(column.columns) == 1, "Expected DataFrame with 1 column"
+        col_name = column.columns[0]
+        _udf = udf(parse, sparktypes.TimestampType())
+        return column.withColumn(col_name, _udf(col_name))
+
+    # Expectations
     @DocInherit
     @MetaSparkDFDataset.column_map_expectation
     def expect_column_values_to_be_in_set(
@@ -223,11 +288,15 @@ class SparkDFDataset(MetaSparkDFDataset):
             column,  # pyspark.sql.DataFrame
             value_set,  # List[Any]
             mostly=None,
+            parse_strings_as_datetimes=None,
             result_format=None,
             include_config=False,
             catch_exceptions=None,
             meta=None,
     ):
+        if parse_strings_as_datetimes:
+            column = self._apply_dateutil_parse(column)
+            value_set = [parse(value) if isinstance(value, string_types) else value for value in value_set]
         success_udf = udf(lambda x: x in value_set)
         return column.withColumn('__success', success_udf(column[0]))
 
@@ -369,96 +438,3 @@ class SparkDFDataset(MetaSparkDFDataset):
         # not sure know about casting to string here
         success_udf = udf(lambda x: re.findall(regex, str(x)) == [])
         return column.withColumn('__success', success_udf(column[0]))
-
-    @DocInherit
-    @MetaSparkDFDataset.column_aggregate_expectation
-    def expect_column_kl_divergence_to_be_less_than(
-        self,
-        column,
-        partition_object=None,
-        threshold=None,
-        tail_weight_holdout=0,
-        internal_weight_holdout=0,
-        result_format=None,
-        include_config=False,
-        catch_exceptions=None,
-        meta=None,
-    ):
-        # TODO consider refactoring the logic that is shared here
-        if not is_valid_partition_object(partition_object):
-            raise ValueError("Invalid partition object.")
-
-        if (not isinstance(threshold, (int, float))) or (threshold < 0):
-            raise ValueError(
-                "Threshold must be specified, greater than or equal to zero.")
-
-        if (not isinstance(tail_weight_holdout, (int, float))) or (tail_weight_holdout < 0) or (tail_weight_holdout > 1):
-            raise ValueError(
-                "tail_weight_holdout must be between zero and one.")
-
-        if (not isinstance(internal_weight_holdout, (int, float))) or (internal_weight_holdout < 0) or (internal_weight_holdout > 1):
-            raise ValueError(
-                "internal_weight_holdout must be between zero and one.")
-
-        if(tail_weight_holdout != 0 and "tail_weights" in partition_object):
-            raise ValueError(
-                "tail_weight_holdout must be 0 when using tail_weights in partition object")
-
-        # TODO: add checks for duplicate values in is_valid_categorical_partition_object
-        if is_valid_categorical_partition_object(partition_object):
-            if internal_weight_holdout > 0:
-                raise ValueError(
-                    "Internal weight holdout cannot be used for discrete data.")
-
-            # Data are expected to be discrete, use value_counts
-            col_name = column.columns[0]
-            observed_counts = self.column_value_counts[col_name]
-            observed_weights = observed_counts / self.row_count
-            expected_weights = pd.Series(
-                partition_object['weights'], index=partition_object['values'], name='expected')
-            # test_df = pd.concat([expected_weights, observed_weights], axis=1, sort=True) # Sort not available before pandas 0.23.0
-            test_df = pd.concat([expected_weights, observed_weights], axis=1)
-
-            na_counts = test_df.isnull().sum()
-
-            # Handle NaN: if we expected something that's not there, it's just not there.
-            pk = test_df[col_name].fillna(0)
-            # Handle NaN: if something's there that was not expected, substitute the relevant value for tail_weight_holdout
-            if na_counts['expected'] > 0:
-                # Scale existing expected values
-                test_df['expected'] = test_df['expected'] * \
-                    (1 - tail_weight_holdout)
-                # Fill NAs with holdout.
-                qk = test_df['expected'].fillna(
-                    tail_weight_holdout / na_counts['expected'])
-            else:
-                qk = test_df['expected']
-
-            kl_divergence = stats.entropy(pk, qk)
-
-            if(np.isinf(kl_divergence) or np.isnan(kl_divergence)):
-                observed_value = None
-            else:
-                observed_value = kl_divergence
-
-            return_obj = {
-                "success": kl_divergence <= threshold,
-                "result": {
-                    "observed_value": observed_value,
-                    "details": {
-                        "observed_partition": {
-                            "values": test_df.index.tolist(),
-                            "weights": pk.tolist()
-                        },
-                        "expected_partition": {
-                            "values": test_df.index.tolist(),
-                            "weights": qk.tolist()
-                        }
-                    }
-                }
-            }
-        else:
-            # TODO
-            raise NotImplementedError('Not implemented for continuous distributions')
-
-        return return_obj

@@ -5,16 +5,50 @@ Changelog and Roadmap
 
 Planned Features
 ----------------
-* More expectation coverage in SqlAlchemyDataset
+* Improved project initialization and data contexts
 * Improved variable typing
-* New Datasets (e.g. Spark)
 * Support for non-tabular datasources (e.g. JSON, XML, AVRO)
-* Real-time/streaming and adaption of distributional expectations
 
 
-v.0.4.5__develop
+v.0.6.0__develop
+________________
+
+
+v.0.6.0
+------------
+* Add support for SparkDFDataset and caching (HUGE work from @cselig)
+* Migrate distributional expectations to new testing framework
+* Add support for two new expectations: expect_column_distinct_values_to_contain_set 
+  and expect_column_distinct_values_to_equal_set (thanks @RoyalTS)
+* FUTURE BREAKING CHANGE: The new cache mechanism for Datasets, \
+  when enabled, causes GE to assume that dataset does not change between evaluation of individual expectations. \
+  We anticipate this will become the future default behavior.
+* BREAKING CHANGE: Drop official support for python 2 and pandas < 0.22
+
+
+v.0.5.1
+---------------
+* Fix issue where no result_format available for expect_column_values_to_be_null caused error
+* Use vectorized computation in pandas (#443, #445; thanks @RoyalTS)
+
+
+v.0.5.0
 ----------------
+* Restructured class hierarchy to have a more generic DataAsset parent that maintains expectation logic separate \
+    from the tabular organization of Dataset expectations
+* Added new FileDataAsset and associated expectations (#416 thanks @anhollis)
 * Added support for date/datetime type columns in some SQLAlchemy expectations (#413)
+* Added support for a multicolumn expectation, expect multicolumn values to be unique (#408)
+* Optimization: You can now disable `partial_unexpected_counts` by setting the \
+    `partial_unexpected_count` value to 0 in the result_format argument, and we do not compute it when it would
+    not be returned. (#431, thanks @eugmandel)
+* Fix: Correct error in unexpected_percent computations for sqlalchemy when unexpected values exceed limit (#424)
+* Fix: Pass meta object to expectation result (#415, thanks @jseeman)
+* Add support for multicolumn expectations, with `expect_multicolumn_values_to_be_unique` as an example (#406)
+* Add dataset class to from_pandas to simplify using custom datasets (#404, thanks @jtilly)
+* Add schema support for sqlalchemy data context (#410, thanks @rahulj51)
+* Minor documentation, warning, and testing improvements (thanks @zdog).
+
 
 v.0.4.5
 ----------------

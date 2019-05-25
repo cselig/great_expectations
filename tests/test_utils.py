@@ -19,6 +19,7 @@ from great_expectations.dataset.util import Datasets
 import great_expectations.dataset.autoinspect as autoinspect
 from great_expectations.util import types
 
+CONTEXTS = ['PandasDataset', 'SqlAlchemyDataset', 'SparkDFDataset']
 
 # Taken from the following stackoverflow:
 # https://stackoverflow.com/questions/23549419/assert-that-two-dictionaries-are-almost-equal
@@ -60,7 +61,7 @@ def assertDeepAlmostEqual(expected, actual, *args, **kwargs):
         raise exc
 
 
-def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.columns_exist):
+def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.columns_exist, caching=False):
     """For Pandas, data should be either a DataFrame or a dictionary that can
     be instantiated as a DataFrame.
     For SQL, data should have the following shape:
@@ -76,7 +77,7 @@ def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.c
         if schemas and "pandas" in schemas:
             pandas_schema = types.get_schema(schemas['pandas'], Datasets.PANDAS)
             df = df.astype(pandas_schema)
-        return PandasDataset(df, autoinspect_func=autoinspect_func)
+        return PandasDataset(df, autoinspect_func=autoinspect_func, caching=caching)
     elif dataset_type == 'SqlAlchemyDataset':
         # Create a new database
 
@@ -120,7 +121,7 @@ def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.c
         df.to_sql(name=tablename, con=conn, index=False, dtype=sql_dtypes)
 
         # Build a SqlAlchemyDataset using that database
-        return SqlAlchemyDataset(tablename, engine=conn, autoinspect_func=autoinspect_func)
+        return SqlAlchemyDataset(tablename, engine=conn, autoinspect_func=autoinspect_func, caching=caching)
 
     elif dataset_type == 'SparkDFDataset':
         spark = SparkSession.builder.getOrCreate()
@@ -128,12 +129,34 @@ def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.c
         if schemas and 'spark' in schemas:
             schema = schemas['spark']
             spark_schema = types.get_schema(schemas['spark'], Datasets.SPARK)
+            # sometimes first method causes Spark to throw a TypeError
+            try:
+                spark_schema = sparktypes.StructType([
+                    sparktypes.StructField(column, types.SPARK_TYPES[schema[column]]())
+                    for column in schema
+                ])
+                spark_df = spark.createDataFrame(data_reshaped, spark_schema)
+            except TypeError:
+                string_schema = sparktypes.StructType([
+                    sparktypes.StructField(column, sparktypes.StringType())
+                    for column in schema
+                ])
+                spark_df = spark.createDataFrame(data_reshaped, string_schema)
+                for c in spark_df.columns:
+                    spark_df = spark_df.withColumn(c, spark_df[c].cast(types.SPARK_TYPES[schema[c]]()))
+        elif len(data_reshaped) == 0:
+            # if we have an empty dataset and no schema, need to assign an arbitrary type
+            columns = list(data.keys())
+            spark_schema = sparktypes.StructType([
+                sparktypes.StructField(column, sparktypes.StringType())
+                for column in columns
+            ])
             spark_df = spark.createDataFrame(data_reshaped, spark_schema)
         else:
             # if no schema provided, uses Spark's schema inference
             columns = list(data.keys()) # do we need to care about the order here?
             spark_df = spark.createDataFrame(data_reshaped, columns)
-        return SparkDFDataset(spark_df)
+        return SparkDFDataset(spark_df, caching=caching)
 
     else:
         raise ValueError("Unknown dataset_type " + str(dataset_type))
@@ -142,17 +165,19 @@ def get_dataset(dataset_type, data, schemas=None, autoinspect_func=autoinspect.c
 def candidate_test_is_on_temporary_notimplemented_list(context, expectation_type):
     if context == "SqlAlchemyDataset":
         return expectation_type in [
-            #"expect_column_to_exist",
-            #"expect_table_row_count_to_be_between",
-            #"expect_table_row_count_to_equal",
-            #"expect_table_columns_to_match_ordered_list",
-            #"expect_column_values_to_be_unique",
+            # "expect_column_to_exist",
+            # "expect_table_row_count_to_be_between",
+            # "expect_table_row_count_to_equal",
+            # "expect_table_columns_to_match_ordered_list",
+            # "expect_column_values_to_be_unique",
             # "expect_column_values_to_not_be_null",
             # "expect_column_values_to_be_null",
             "expect_column_values_to_be_of_type",
             "expect_column_values_to_be_in_type_list",
             # "expect_column_values_to_be_in_set",
             # "expect_column_values_to_not_be_in_set",
+            # "expect_column_distinct_values_to_equal_set",
+            # "expect_column_distinct_values_to_contain_set",
             # "expect_column_values_to_be_between",
             "expect_column_values_to_be_increasing",
             "expect_column_values_to_be_decreasing",
@@ -172,12 +197,12 @@ def candidate_test_is_on_temporary_notimplemented_list(context, expectation_type
             #"expect_column_unique_value_count_to_be_between",
             #"expect_column_proportion_of_unique_values_to_be_between",
             "expect_column_most_common_value_to_be_in_set",
-            #"expect_column_sum_to_be_between",
-            #"expect_column_min_to_be_between",
-            #"expect_column_max_to_be_between",
-            "expect_column_chisquare_test_p_value_to_be_greater_than",
+            # "expect_column_sum_to_be_between",
+            # "expect_column_min_to_be_between",
+            # "expect_column_max_to_be_between",
+            # "expect_column_chisquare_test_p_value_to_be_greater_than",
             "expect_column_bootstrapped_ks_test_p_value_to_be_greater_than",
-            "expect_column_kl_divergence_to_be_less_than",
+            # "expect_column_kl_divergence_to_be_less_than",
             "expect_column_parameterized_distribution_ks_test_p_value_to_be_greater_than",
             "expect_column_pair_values_to_be_equal",
             "expect_column_pair_values_A_to_be_greater_than_B",
@@ -189,19 +214,21 @@ def candidate_test_is_on_temporary_notimplemented_list(context, expectation_type
             # "expect_column_to_exist",
             # "expect_table_row_count_to_be_between",
             # "expect_table_row_count_to_equal",
-            "expect_table_columns_to_match_ordered_list",
-            "expect_column_values_to_be_unique",
-            "expect_column_values_to_not_be_null",
-            "expect_column_values_to_be_null",
+            # "expect_table_columns_to_match_ordered_list",
+            # "expect_column_values_to_be_unique",
+            # "expect_column_values_to_not_be_null",
+            # "expect_column_values_to_be_null",
             "expect_column_values_to_be_of_type",
             "expect_column_values_to_be_in_type_list",
-            "expect_column_values_to_be_in_set",
-            "expect_column_values_to_not_be_in_set",
+            # "expect_column_values_to_be_in_set",
+            # "expect_column_values_to_not_be_in_set",
+            # "expect_column_distinct_values_to_equal_set",
+            # "expect_column_distinct_values_to_contain_set",
             "expect_column_values_to_be_between",
             "expect_column_values_to_be_increasing",
             "expect_column_values_to_be_decreasing",
             "expect_column_value_lengths_to_be_between",
-            "expect_column_value_lengths_to_equal",
+            # "expect_column_value_lengths_to_equal",
             # "expect_column_values_to_match_regex",
             # "expect_column_values_to_not_match_regex",
             "expect_column_values_to_match_regex_list",
@@ -217,11 +244,11 @@ def candidate_test_is_on_temporary_notimplemented_list(context, expectation_type
             # "expect_column_proportion_of_unique_values_to_be_between",
             # "expect_column_most_common_value_to_be_in_set",
             # "expect_column_sum_to_be_between",
-            "expect_column_min_to_be_between",
-            "expect_column_max_to_be_between",
-            "expect_column_chisquare_test_p_value_to_be_greater_than",
+            # "expect_column_min_to_be_between",
+            # "expect_column_max_to_be_between",
+            # "expect_column_chisquare_test_p_value_to_be_greater_than",
             "expect_column_bootstrapped_ks_test_p_value_to_be_greater_than",
-            "expect_column_kl_divergence_to_be_less_than",
+            # "expect_column_kl_divergence_to_be_less_than",
             "expect_column_parameterized_distribution_ks_test_p_value_to_be_greater_than",
             "expect_column_pair_values_to_be_equal",
             "expect_column_pair_values_A_to_be_greater_than_B",
@@ -292,8 +319,8 @@ def evaluate_json_test(data_asset, expectation_type, test):
                 assert result['success'] == value
 
             elif key == 'observed_value':
-                if 'tolerance' in test['out']:
-                    assert np.allclose(result['result']['observed_value'], value, rtol=test['out']['tolerance'])
+                if 'tolerance' in test:
+                    assert np.allclose(result['result']['observed_value'], value, rtol=test['tolerance'])
                 else:
                     assert value == result['result']['observed_value']
 
@@ -311,15 +338,38 @@ def evaluate_json_test(data_asset, expectation_type, test):
             elif key == 'details':
                 assert result['result']['details'] == value
 
+            elif key.startswith("observed_cdf"):
+                if "x_-1" in key:
+                    if key.endswith("gt"):
+                        assert result["result"]["details"]["observed_cdf"]["x"][-1] > value
+                    else:
+                        assert result["result"]["details"]["observed_cdf"]["x"][-1] == value
+                elif "x_0" in key:
+                    if key.endswith("lt"):
+                        assert result["result"]["details"]["observed_cdf"]["x"][0] < value
+                    else:
+                        assert result["result"]["details"]["observed_cdf"]["x"][0] == value
+                else:
+                    raise ValueError(
+                        "Invalid test specification: unknown key " + key + " in 'out'")
+
             elif key == 'traceback_substring':
                 assert result['exception_info']['raised_exception']
                 assert value in result['exception_info']['exception_traceback'], "expected to find " + \
                     value + " in " + \
                     result['exception_info']['exception_traceback']
-
-            elif key == 'tolerance':
-                # tolerance is used when checking observed_value
-                pass
+            
+            elif key == "expected_partition":
+                assert np.allclose(result["result"]["details"]["expected_partition"]["bins"], value["bins"])
+                assert np.allclose(result["result"]["details"]["expected_partition"]["weights"], value["weights"])
+                if "tail_weights" in result["result"]["details"]["expected_partition"]:
+                    assert np.allclose(result["result"]["details"]["expected_partition"]["tail_weights"], value["tail_weights"])
+     
+            elif key == "observed_partition":
+                assert np.allclose(result["result"]["details"]["observed_partition"]["bins"], value["bins"])
+                assert np.allclose(result["result"]["details"]["observed_partition"]["weights"], value["weights"])
+                if "tail_weights" in result["result"]["details"]["observed_partition"]:
+                    assert np.allclose(result["result"]["details"]["observed_partition"]["tail_weights"], value["tail_weights"])
 
             else:
                 raise ValueError(

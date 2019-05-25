@@ -1,19 +1,25 @@
 from __future__ import division
+from six import PY3, string_types
 
 from functools import wraps
 import inspect
-from six import PY3
-from six import string_types
+import logging
 import sys
-import sqlalchemy as sa
-from sqlalchemy.engine import reflection
+import warnings
+
+logger = logging.getLogger(__name__)
+
+try:
+    import sqlalchemy as sa
+    from sqlalchemy.engine import reflection
+except ImportError:
+    logger.error("Unable to load SqlAlchemy context; install optional sqlalchemy dependency for support")
+    raise
+
+import pandas as pd
+
 from dateutil.parser import parse
 from datetime import datetime
-
-if sys.version_info.major == 2:  # If python 2
-    from itertools import izip_longest as zip_longest
-elif sys.version_info.major == 3:  # If python 3
-    from itertools import zip_longest
 
 from .dataset import Dataset
 from great_expectations.data_asset.util import DocInherit, parse_result_format
@@ -45,6 +51,7 @@ class MetaSqlAlchemyDataset(Dataset):
             result_format = parse_result_format(result_format)
 
             if result_format['result_format'] == 'COMPLETE':
+                warnings.warn("Setting result format to COMPLETE for a SqlAlchemyDataset can be dangerous because it will not limit the number of returned results.")
                 unexpected_count_limit = None
             else:
                 unexpected_count_limit = result_format['partial_unexpected_count']
@@ -56,6 +63,12 @@ class MetaSqlAlchemyDataset(Dataset):
             ignore_values = [None]
             if func.__name__ in ['expect_column_values_to_not_be_null', 'expect_column_values_to_be_null']:
                 ignore_values = []
+                # Counting the number of unexpected values can be expensive when there is a large
+                # number of np.nan values.
+                # This only happens on expect_column_values_to_not_be_null expectations.
+                # Since there is no reason to look for most common unexpected values in this case,
+                # we will instruct the result formatting method to skip this step.
+                result_format['partial_unexpected_count'] = 0 
 
             count_query = sa.select([
                 sa.func.count().label('element_count'),
@@ -137,7 +150,9 @@ class MetaSqlAlchemyDataset(Dataset):
                 success,
                 count_results['element_count'],
                 nonnull_count,
+                count_results['unexpected_count'],
                 maybe_limited_unexpected_list,
+                None,
             )
 
             if func.__name__ in ['expect_column_values_to_not_be_null', 'expect_column_values_to_be_null']:
@@ -145,6 +160,7 @@ class MetaSqlAlchemyDataset(Dataset):
                 del return_obj['result']['unexpected_percent_nonmissing']
                 try:
                     del return_obj['result']['partial_unexpected_counts']
+                    del return_obj['result']['partial_unexpected_list']
                 except KeyError:
                     pass
 
@@ -198,15 +214,15 @@ class SqlAlchemyDataset(MetaSqlAlchemyDataset):
         # Only call super once connection is established and table_name and columns known to allow autoinspection
         super(SqlAlchemyDataset, self).__init__(*args, **kwargs)
 
-    def _get_row_count(self):
+    def get_row_count(self):
         count_query = sa.select([sa.func.count()]).select_from(
             self._table)
         return self.engine.execute(count_query).scalar()
 
-    def _get_table_columns(self):
+    def get_table_columns(self):
         return [col['name'] for col in self.columns]
 
-    def _get_column_nonnull_count(self, column):
+    def get_column_nonnull_count(self, column):
         ignore_values = [None]
         count_query = sa.select([
             sa.func.count().label('element_count'),
@@ -223,38 +239,56 @@ class SqlAlchemyDataset(MetaSqlAlchemyDataset):
         null_count = count_results['null_count'] or 0
         return element_count - null_count
 
-    def _get_column_sum(self, column):
+    def get_column_sum(self, column):
         return self.engine.execute(
             sa.select([sa.func.sum(sa.column(column))]).select_from(
                 self._table)
         ).scalar()
 
-    def _get_column_max(self, column):
+    def get_column_max(self, column, parse_strings_as_datetimes=False):
+        if parse_strings_as_datetimes:
+            raise NotImplementedError
         return self.engine.execute(
             sa.select([sa.func.max(sa.column(column))]).select_from(
                 self._table)
         ).scalar()
 
-    def _get_column_min(self, column):
+    def get_column_min(self, column, parse_strings_as_datetimes=False):
+        if parse_strings_as_datetimes:
+            raise NotImplementedError
         return self.engine.execute(
             sa.select([sa.func.min(sa.column(column))]).select_from(
                 self._table)
         ).scalar()
+    
+    def get_column_value_counts(self, column):
+        results = self.engine.execute(
+            sa.select([
+                sa.column(column).label("value"),
+                sa.func.count(sa.column(column)).label("count"),
+            ]).where(sa.column(column) != None) \
+              .group_by(sa.column(column)) \
+              .select_from(self._table)).fetchall()
+        return pd.Series(
+            [row[1] for row in results],
+            index=[row[0] for row in results],
+            name=column
+        )
 
-    def _get_column_mean(self, column):
+    def get_column_mean(self, column):
         return self.engine.execute(
             sa.select([sa.func.avg(sa.column(column))]).select_from(
                 self._table)
         ).scalar()
 
-    def _get_column_unique_count(self, column):
+    def get_column_unique_count(self, column):
         return self.engine.execute(
             sa.select([sa.func.count(sa.func.distinct(sa.column(column)))]).select_from(
                 self._table)
         ).scalar()
 
-    def _get_column_median(self, column):
-        nonnull_count = self.column_nonnull_counts[column]
+    def get_column_median(self, column):
+        nonnull_count = self.get_column_nonnull_count(column)
         element_values = self.engine.execute(
             sa.select([sa.column(column)]).order_by(sa.column(column)).where(
                 sa.column(column) != None
@@ -275,6 +309,60 @@ class SqlAlchemyDataset(MetaSqlAlchemyDataset):
             # An odd number of column values, we can just take the center value
             column_median = column_values[1][0]  # True center value
         return column_median
+
+    def get_column_hist(self, column, bins):
+        # TODO: this is **terribly** inefficient; consider refactor
+        """return a list of counts corresponding to bins"""
+        hist = []
+        for i in range(0, len(bins) - 1):
+            # all bins except last are half-open
+            if i == len(bins) - 2:
+                max_strictly = False
+            else:
+                max_strictly = True
+            hist.append(
+                self.get_column_count_in_range(column, min_val=bins[i], max_val=bins[i + 1], max_strictly=max_strictly)
+            )
+        return hist
+
+    def get_column_count_in_range(self, column, min_val=None, max_val=None, min_strictly=False, max_strictly=True):
+        if min_val is None and max_val is None:
+            raise ValueError('Must specify either min or max value')
+        if min_val is not None and max_val is not None and min_val > max_val:
+            raise ValueError('Min value must be <= to max value')
+
+        min_condition = None
+        max_condition = None
+        if min_val is not None:
+            if min_strictly:
+                min_condition = sa.column(column) > min_val
+            else:
+                min_condition = sa.column(column) >= min_val
+        if max_val is not None:
+            if max_strictly:
+                max_condition = sa.column(column) < max_val
+            else:
+                max_condition = sa.column(column) <= max_val
+        
+        if min_condition is not None and max_condition is not None:
+            condition = sa.and_(min_condition, max_condition)
+        elif min_condition is not None:
+            condition = min_condition
+        else:
+            condition = max_condition
+
+        query = query = sa.select([
+                    sa.func.count((sa.column(column)))
+                ]) \
+                .where(
+                    sa.and_(
+                        sa.column(column) != None,
+                        condition
+                    )
+                ) \
+                .select_from(self._table)
+        
+        return self.engine.execute(query).scalar()
 
     def create_temporary_table(self, table_name, custom_sql):
         """
@@ -334,7 +422,7 @@ class SqlAlchemyDataset(MetaSqlAlchemyDataset):
                                           result_format=None, include_config=False, catch_exceptions=None, meta=None
                                           ):
         if parse_strings_as_datetimes:
-            parsed_value_set = [parse(value) if isinstance(value, string_types) else value for value in value_set]
+            parsed_value_set = self._parse_value_set(value_set)
         else:
             parsed_value_set = value_set
         return sa.column(column).in_(tuple(parsed_value_set))
@@ -345,9 +433,14 @@ class SqlAlchemyDataset(MetaSqlAlchemyDataset):
                                               column,
                                               value_set,
                                               mostly=None,
+                                              parse_strings_as_datetimes=None,
                                               result_format=None, include_config=False, catch_exceptions=None, meta=None
                                               ):
-        return sa.column(column).notin_(tuple(value_set))
+        if parse_strings_as_datetimes:
+            parsed_value_set = self._parse_value_set(value_set)
+        else:
+            parsed_value_set = value_set
+        return sa.column(column).notin_(tuple(parsed_value_set))
 
     @DocInherit
     @MetaSqlAlchemyDataset.column_map_expectation
@@ -429,16 +522,6 @@ class SqlAlchemyDataset(MetaSqlAlchemyDataset):
 
         elif min_value is not None and max_value is None:
             return sa.func.length(sa.column(column)) >= min_value
-
-    ###
-    ###
-    ###
-    #
-    # Column Aggregate Expectation Implementations
-    #
-    ###
-    ###
-    ###
 
     @MetaSqlAlchemyDataset.column_map_expectation
     def expect_column_values_to_be_unique(self, column, mostly=None,

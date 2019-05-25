@@ -14,11 +14,6 @@ from scipy import stats
 from six import PY3, integer_types, string_types
 from numbers import Number
 
-if sys.version_info.major == 2:  # If python 2
-    from itertools import izip_longest as zip_longest
-elif sys.version_info.major == 3:  # If python 3
-    from itertools import zip_longest
-
 from .dataset import Dataset
 from great_expectations.data_asset.util import DocInherit, parse_result_format
 from great_expectations.util import types
@@ -70,6 +65,12 @@ class MetaPandasDataset(Dataset):
             ignore_values = [None, np.nan]
             if func.__name__ in ['expect_column_values_to_not_be_null', 'expect_column_values_to_be_null']:
                 ignore_values = []
+                # Counting the number of unexpected values can be expensive when there is a large
+                # number of np.nan values.
+                # This only happens on expect_column_values_to_not_be_null expectations.
+                # Since there is no reason to look for most common unexpected values in this case,
+                # we will instruct the result formatting method to skip this step.
+                result_format['partial_unexpected_count'] = 0 
 
             series = self[column]
 
@@ -102,6 +103,7 @@ class MetaPandasDataset(Dataset):
             return_obj = self._format_map_output(
                 result_format, success,
                 element_count, nonnull_count,
+                len(unexpected_list),
                 unexpected_list, unexpected_index_list
             )
 
@@ -110,6 +112,7 @@ class MetaPandasDataset(Dataset):
                 del return_obj['result']['unexpected_percent_nonmissing']
                 try:
                     del return_obj['result']['partial_unexpected_counts']
+                    del return_obj['result']['partial_unexpected_list']
                 except KeyError:
                     pass
 
@@ -184,6 +187,7 @@ class MetaPandasDataset(Dataset):
             return_obj = self._format_map_output(
                 result_format, success,
                 element_count, nonnull_count,
+                len(unexpected_list),
                 unexpected_list, unexpected_index_list
             )
 
@@ -239,6 +243,7 @@ class MetaPandasDataset(Dataset):
             return_obj = self._format_map_output(
                 result_format, success,
                 element_count, nonnull_count,
+                len(unexpected_list),
                 unexpected_list.to_dict(orient='records'), unexpected_index_list
             )
 
@@ -270,18 +275,7 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
     # case is that we want the former, but also want to re-initialize these values to None so we don't
     # get an attribute error when trying to access them (I think this could be done in __finalize__?)
     _internal_names = pd.DataFrame._internal_names + [
-        '_row_count',
-        '_table_columns',
-        '_column_nonnull_counts',
-        '_column_means',
-        '_column_value_counts',
-        '_column_sums',
-        '_column_maxes',
-        '_column_mins',
-        '_column_unique_counts',
-        '_column_modes' ,
-        '_column_medians',
-        '_column_stdevs',
+        'caching',
     ]
     _internal_names_set = set(_internal_names)
 
@@ -313,44 +307,75 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
         self.discard_subset_failing_expectations = kwargs.get(
             'discard_subset_failing_expectations', False)
 
-    def _get_row_count(self):
+    def get_row_count(self):
         return self.shape[0]
 
-    def _get_table_columns(self):
+    def get_table_columns(self):
         return list(self.columns)
 
-    def _get_column_sum(self, column):
+    def get_column_sum(self, column):
         return self[column].sum()
 
-    def _get_column_max(self, column):
-        return self[column].max()
+    def get_column_max(self, column, parse_strings_as_datetimes=False):
+        temp_column = self[column].dropna()
+        if parse_strings_as_datetimes:
+            temp_column = temp_column.map(parse)
+        return temp_column.max()
 
-    def _get_column_min(self, column):
-        return self[column].min()
+    def get_column_min(self, column, parse_strings_as_datetimes=False):
+        temp_column = self[column].dropna()
+        if parse_strings_as_datetimes:
+            temp_column = temp_column.map(parse)
+        return temp_column.min()
 
-    def _get_column_mean(self, column):
+    def get_column_mean(self, column):
         return self[column].mean()
 
-    def _get_column_nonnull_count(self, column):
+    def get_column_nonnull_count(self, column):
         series = self[column]
         null_indexes = series.isnull()
         nonnull_values = series[null_indexes == False]
         return len(nonnull_values)
 
-    def _get_column_value_counts(self, column):
+    def get_column_value_counts(self, column):
         return self[column].value_counts()
 
-    def _get_column_unique_count(self, column):
-        return self.column_value_counts[column].shape[0]
+    def get_column_unique_count(self, column):
+        return self.get_column_value_counts(column).shape[0]
 
-    def _get_column_modes(self, column):
+    def get_column_modes(self, column):
         return list(self[column].mode().values)
 
-    def _get_column_median(self, column):
+    def get_column_median(self, column):
         return self[column].median()
 
-    def _get_column_stdev(self, column):
+    def get_column_stdev(self, column):
         return self[column].std()
+
+    def get_column_hist(self, column, bins):
+        hist, bin_edges = np.histogram(self[column], bins, density=False)
+        return list(hist)
+
+    def get_column_count_in_range(self, column, min_val=None, max_val=None, min_strictly=False, max_strictly=True):
+        # TODO this logic could probably go in the non-underscore version if we want to cache
+        if min_val is None and max_val is None:
+            raise ValueError('Must specify either min or max value')
+        if min_val is not None and max_val is not None and min_val > max_val:
+            raise ValueError('Min value must be <= to max value')
+
+        result = self[column]
+        if min_val is not None:
+            if min_strictly:
+                result = result[result > min_val]
+            else:
+                result = result[result >= min_val]
+        if max_val is not None:
+            if max_strictly:
+                result = result[result < max_val]
+            else:
+                result = result[result <= max_val]
+        return len(result)
+
 
     ### Expectation methods ###
 
@@ -359,8 +384,8 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
     def expect_column_values_to_be_unique(self, column,
                                           mostly=None,
                                           result_format=None, include_config=False, catch_exceptions=None, meta=None):
-        dupes = set(column[column.duplicated()])
-        return column.map(lambda x: x not in dupes)
+
+        return ~column.duplicated(keep=False)
 
     # @Dataset.expectation(['column', 'mostly', 'result_format'])
     @DocInherit
@@ -369,7 +394,7 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
                                             mostly=None,
                                             result_format=None, include_config=False, catch_exceptions=None, meta=None, include_nulls=True):
 
-        return column.map(lambda x: x is not None and not pd.isnull(x))
+        return ~column.isnull()
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
@@ -377,7 +402,7 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
                                         mostly=None,
                                         result_format=None, include_config=False, catch_exceptions=None, meta=None):
 
-        return column.map(lambda x: x is None or pd.isnull(x))
+        return column.isnull()
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
@@ -409,17 +434,24 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
                                           parse_strings_as_datetimes=None,
                                           result_format=None, include_config=False, catch_exceptions=None, meta=None):
         if parse_strings_as_datetimes:
-            parsed_value_set = [parse(value) if isinstance(value, string_types) else value for value in value_set]
+            parsed_value_set = self._parse_value_set(value_set)
         else:
             parsed_value_set = value_set
-        return column.map(lambda x: x in parsed_value_set)
+
+        return column.isin(parsed_value_set)
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
     def expect_column_values_to_not_be_in_set(self, column, value_set,
                                               mostly=None,
+                                              parse_strings_as_datetimes=None,
                                               result_format=None, include_config=False, catch_exceptions=None, meta=None):
-        return column.map(lambda x: x not in value_set)
+        if parse_strings_as_datetimes:
+            parsed_value_set = self._parse_value_set(value_set)
+        else:
+            parsed_value_set = value_set
+
+        return ~column.isin(parsed_value_set)
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
@@ -447,7 +479,7 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
         else:
             temp_column = column
 
-        if min_value != None and max_value != None and min_value > max_value:
+        if min_value is not None and max_value is not None and min_value > max_value:
             raise ValueError("min_value cannot be greater than max_value")
 
         def is_between(val):
@@ -458,7 +490,7 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
             if type(val) == None:
                 return False
             else:
-                if min_value != None and max_value != None:
+                if min_value is not None and max_value is not None:
                     if allow_cross_type_comparisons:
                         try:
                             return (min_value <= val) and (val <= max_value)
@@ -472,7 +504,7 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
 
                         return (min_value <= val) and (val <= max_value)
 
-                elif min_value == None and max_value != None:
+                elif min_value is None and max_value is not None:
                     if allow_cross_type_comparisons:
                         try:
                             return val <= max_value
@@ -486,7 +518,7 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
 
                         return val <= max_value
 
-                elif min_value != None and max_value == None:
+                elif min_value is not None and max_value is None:
                     if allow_cross_type_comparisons:
                         try:
                             return min_value <= val
@@ -581,43 +613,40 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
         except ValueError:
             raise ValueError("min_value and max_value must be integers")
 
-        def length_is_between(val):
-            if min_value != None and max_value != None:
-                return len(val) >= min_value and len(val) <= max_value
+        column_lengths = column.astype(str).str.len()
 
-            elif min_value == None and max_value != None:
-                return len(val) <= max_value
+        if min_value is not None and max_value is not None:
+            return column_lengths.between(min_value, max_value)
 
-            elif min_value != None and max_value == None:
-                return len(val) >= min_value
+        elif min_value is None and max_value is not None:
+            return column_lengths <= max_value
 
-            else:
-                return False
+        elif min_value is not None and max_value is None:
+            return column_lengths >= min_value
 
-        return column.map(length_is_between)
+        else:
+            return False
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
     def expect_column_value_lengths_to_equal(self, column, value,
                                              mostly=None,
                                              result_format=None, include_config=False, catch_exceptions=None, meta=None):
-        return column.map(lambda x: len(x) == value)
+        return column.str.len() == value
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
     def expect_column_values_to_match_regex(self, column, regex,
                                             mostly=None,
                                             result_format=None, include_config=False, catch_exceptions=None, meta=None):
-        return column.map(
-            lambda x: re.findall(regex, str(x)) != []
-        )
+        return column.astype(str).str.contains(regex)
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
     def expect_column_values_to_not_match_regex(self, column, regex,
                                                 mostly=None,
                                                 result_format=None, include_config=False, catch_exceptions=None, meta=None):
-        return column.map(lambda x: re.findall(regex, str(x)) == [])
+        return ~column.astype(str).str.contains(regex)
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
@@ -625,33 +654,30 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
                                                  mostly=None,
                                                  result_format=None, include_config=False, catch_exceptions=None, meta=None):
 
+        regex_matches = []
+        for regex in regex_list:
+            regex_matches.append(column.astype(str).str.contains(regex))
+        regex_match_df = pd.concat(regex_matches, axis=1, ignore_index=True)
+
         if match_on == "any":
-
-            def match_in_list(val):
-                if any(re.findall(regex, str(val)) for regex in regex_list):
-                    return True
-                else:
-                    return False
-
+            return regex_match_df.any(axis='columns')
         elif match_on == "all":
+            return regex_match_df.all(axis='columns')
+        else:
+            raise ValueError("match_on must be either 'any' or 'all'")
 
-            def match_in_list(val):
-                if all(re.findall(regex, str(val)) for regex in regex_list):
-                    return True
-                else:
-                    return False
-
-        return column.map(match_in_list)
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
     def expect_column_values_to_not_match_regex_list(self, column, regex_list,
                                                      mostly=None,
                                                      result_format=None, include_config=False, catch_exceptions=None, meta=None):
-        return column.map(
-            lambda x: not any([re.findall(regex, str(x))
-                               for regex in regex_list])
-        )
+        regex_matches = []
+        for regex in regex_list:
+            regex_matches.append(column.astype(str).str.contains(regex))
+        regex_match_df = pd.concat(regex_matches, axis=1, ignore_index=True)
+
+        return ~regex_match_df.any(axis='columns')
 
     @DocInherit
     @MetaPandasDataset.column_map_expectation
@@ -737,6 +763,8 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
                                                                                     result_format=None,
                                                                                     include_config=False,
                                                                                     catch_exceptions=None, meta=None):
+        column = self[column]
+
         if p_value <= 0 or p_value >= 1:
             raise ValueError("p_value must be between 0 and 1 exclusive")
 
@@ -773,11 +801,17 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
     @MetaPandasDataset.column_aggregate_expectation
     def expect_column_bootstrapped_ks_test_p_value_to_be_greater_than(self, column, partition_object=None, p=0.05, bootstrap_samples=None, bootstrap_sample_size=None,
                                                                       result_format=None, include_config=False, catch_exceptions=None, meta=None):
+        column = self[column]
+
         if not is_valid_continuous_partition_object(partition_object):
             raise ValueError("Invalid continuous partition object.")
 
+        # TODO: consider changing this into a check that tail_weights does not exist exclusively, by moving this check into is_valid_continuous_partition_object
         if (partition_object['bins'][0] == -np.inf) or (partition_object['bins'][-1] == np.inf):
             raise ValueError("Partition endpoints must be finite.")
+
+        if "tail_weights" in partition_object and np.sum(partition_object["tail_weights"]) > 0:
+            raise ValueError("Partition cannot have tail weights -- endpoints must be finite.")
 
         test_cdf = np.append(np.array([0]), np.cumsum(
             partition_object['weights']))
@@ -859,199 +893,6 @@ class PandasDataset(MetaPandasDataset, pd.DataFrame):
 
         return return_obj
 
-    @DocInherit
-    @MetaPandasDataset.column_aggregate_expectation
-    def expect_column_kl_divergence_to_be_less_than(self, column, partition_object=None, threshold=None,
-                                                    tail_weight_holdout=0, internal_weight_holdout=0,
-                                                    result_format=None, include_config=False, catch_exceptions=None, meta=None):
-        if not is_valid_partition_object(partition_object):
-            raise ValueError("Invalid partition object.")
-
-        if (not isinstance(threshold, (int, float))) or (threshold < 0):
-            raise ValueError(
-                "Threshold must be specified, greater than or equal to zero.")
-
-        if (not isinstance(tail_weight_holdout, (int, float))) or (tail_weight_holdout < 0) or (tail_weight_holdout > 1):
-            raise ValueError(
-                "tail_weight_holdout must be between zero and one.")
-
-        if (not isinstance(internal_weight_holdout, (int, float))) or (internal_weight_holdout < 0) or (internal_weight_holdout > 1):
-            raise ValueError(
-                "internal_weight_holdout must be between zero and one.")
-            
-        if(tail_weight_holdout != 0 and "tail_weights" in partition_object):
-            raise ValueError(
-                "tail_weight_holdout must be 0 when using tail_weights in partition object")
-
-        # TODO: add checks for duplicate values in is_valid_categorical_partition_object
-        if is_valid_categorical_partition_object(partition_object):
-            if internal_weight_holdout > 0:
-                raise ValueError(
-                    "Internal weight holdout cannot be used for discrete data.")
-
-            # Data are expected to be discrete, use value_counts
-            observed_weights = column.value_counts() / len(column)
-            expected_weights = pd.Series(
-                partition_object['weights'], index=partition_object['values'], name='expected')
-            # test_df = pd.concat([expected_weights, observed_weights], axis=1, sort=True) # Sort not available before pandas 0.23.0
-            test_df = pd.concat([expected_weights, observed_weights], axis=1)
-
-            na_counts = test_df.isnull().sum()
-
-            # Handle NaN: if we expected something that's not there, it's just not there.
-            pk = test_df[column.name].fillna(0)
-            # Handle NaN: if something's there that was not expected, substitute the relevant value for tail_weight_holdout
-            if na_counts['expected'] > 0:
-                # Scale existing expected values
-                test_df['expected'] = test_df['expected'] * \
-                    (1 - tail_weight_holdout)
-                # Fill NAs with holdout.
-                qk = test_df['expected'].fillna(
-                    tail_weight_holdout / na_counts['expected'])
-            else:
-                qk = test_df['expected']
-
-            kl_divergence = stats.entropy(pk, qk)
-
-            if(np.isinf(kl_divergence) or np.isnan(kl_divergence)):
-                observed_value = None
-            else:
-                observed_value = kl_divergence
-
-            return_obj = {
-                "success": kl_divergence <= threshold,
-                "result": {
-                    "observed_value": observed_value,
-                    "details": {
-                        "observed_partition": {
-                            "values": test_df.index.tolist(),
-                            "weights": pk.tolist()
-                        },
-                        "expected_partition": {
-                            "values": test_df.index.tolist(),
-                            "weights": qk.tolist()
-                        }
-                    }
-                }
-            }
-
-        else:
-            # Data are expected to be continuous; discretize first
-
-            # Build the histogram first using expected bins so that the largest bin is >=
-            hist, bin_edges = np.histogram(column, partition_object['bins'], density=False)
-
-            # Add in the frequencies observed above or below the provided partition
-            below_partition = len(np.where(column < partition_object['bins'][0])[0])
-            above_partition = len(np.where(column > partition_object['bins'][-1])[0])
-
-            #Observed Weights is just the histogram values divided by the total number of observations
-            observed_weights = np.array(hist)/len(column)
-
-            #Adjust expected_weights to account for tail_weight and internal_weight
-            expected_weights = np.array(
-                partition_object['weights']) * (1 - tail_weight_holdout - internal_weight_holdout)
-
-            # Assign internal weight holdout values if applicable
-            if internal_weight_holdout > 0:
-                zero_count = len(expected_weights) - \
-                    np.count_nonzero(expected_weights)
-                if zero_count > 0:
-                    for index, value in enumerate(expected_weights):
-                        if value == 0:
-                            expected_weights[index] = internal_weight_holdout / zero_count
-        
-            # Assign tail weight holdout if applicable
-            # We need to check cases to only add tail weight holdout if it makes sense based on the provided partition.
-            if (partition_object['bins'][0] == -np.inf) and (partition_object['bins'][-1]) == np.inf:
-                if tail_weight_holdout > 0:
-                    raise ValueError("tail_weight_holdout cannot be used for partitions with infinite endpoints.")
-                if "tail_weights" in partition_object:
-                    raise ValueError("There can be no tail weights for partitions with one or both endpoints at infinity")
-                expected_bins = partition_object['bins'][1:-1] #Remove -inf and inf
-                
-                comb_expected_weights=expected_weights
-                expected_tail_weights=np.concatenate(([expected_weights[0]],[expected_weights[-1]])) #Set aside tail weights
-                expected_weights=expected_weights[1:-1] #Remove tail weights
-                
-                comb_observed_weights=observed_weights
-                observed_tail_weights=np.concatenate(([observed_weights[0]],[observed_weights[-1]])) #Set aside tail weights
-                observed_weights=observed_weights[1:-1] #Remove tail weights
-                
-                
-            elif (partition_object['bins'][0] == -np.inf):
-                
-                if "tail_weights" in partition_object:
-                    raise ValueError("There can be no tail weights for partitions with one or both endpoints at infinity")
-                
-                expected_bins = partition_object['bins'][1:] #Remove -inf
-                
-                comb_expected_weights=np.concatenate((expected_weights,[tail_weight_holdout]))
-                expected_tail_weights=np.concatenate(([expected_weights[0]],[tail_weight_holdout])) #Set aside left tail weight and holdout
-                expected_weights = expected_weights[1:] #Remove left tail weight from main expected_weights
-                
-                comb_observed_weights=np.concatenate((observed_weights,[above_partition/len(column)]))
-                observed_tail_weights=np.concatenate(([observed_weights[0]],[above_partition/len(column)])) #Set aside left tail weight and above parition weight
-                observed_weights=observed_weights[1:] #Remove left tail weight from main observed_weights
-        
-            elif (partition_object['bins'][-1] == np.inf):
-                
-                if "tail_weights" in partition_object:
-                    raise ValueError("There can be no tail weights for partitions with one or both endpoints at infinity")
-                
-                expected_bins = partition_object['bins'][:-1] #Remove inf
-                
-                comb_expected_weights=np.concatenate(([tail_weight_holdout],expected_weights))
-                expected_tail_weights=np.concatenate(([tail_weight_holdout],[expected_weights[-1]]))  #Set aside right tail weight and holdout
-                expected_weights = expected_weights[:-1] #Remove right tail weight from main expected_weights
-                
-                comb_observed_weights=np.concatenate(([below_partition/len(column)],observed_weights))
-                observed_tail_weights=np.concatenate(([below_partition/len(column)],[observed_weights[-1]])) #Set aside right tail weight and below partition weight
-                observed_weights=observed_weights[:-1] #Remove right tail weight from main observed_weights
-            else:
-                
-                expected_bins = partition_object['bins'] #No need to remove -inf or inf
-                
-                if "tail_weights" in partition_object:
-                    tail_weights=partition_object["tail_weights"]
-                    comb_expected_weights=np.concatenate(([tail_weights[0]],expected_weights,[tail_weights[1]])) #Tack on tail weights
-                    expected_tail_weights=tail_weights #Tail weights are just tail_weights
-                comb_expected_weights=np.concatenate(([tail_weight_holdout / 2],expected_weights,[tail_weight_holdout / 2]))
-                expected_tail_weights=np.concatenate(([tail_weight_holdout / 2],[tail_weight_holdout / 2])) #Tail weights are just tail_weight holdout divided eaually to both tails
-                
-                comb_observed_weights=np.concatenate(([below_partition/len(column)],observed_weights, [above_partition/len(column)]))
-                observed_tail_weights=np.concatenate(([below_partition],[above_partition]))/len(column) #Tail weights are just the counts on either side of the partition
-                #Main expected_weights and main observered weights had no tail_weights, so nothing needs to be removed.
-        
-     
-            kl_divergence = stats.entropy(comb_observed_weights, comb_expected_weights) 
-            
-            if(np.isinf(kl_divergence) or np.isnan(kl_divergence)):
-                observed_value = None
-            else:
-                observed_value = kl_divergence
-
-            return_obj = {
-                    "success": kl_divergence <= threshold,
-                    "result": {
-                        "observed_value": observed_value,
-                        "details": {
-                            "observed_partition": {
-                                # return expected_bins, since we used those bins to compute the observed_weights
-                                "bins": expected_bins,
-                                "weights": observed_weights.tolist(),
-                                "tail_weights":observed_tail_weights.tolist()
-                            },
-                            "expected_partition": {
-                                "bins": expected_bins,
-                                "weights": expected_weights.tolist(),
-                                "tail_weights":expected_tail_weights.tolist()
-                            }
-                        }
-                    }
-                }
-                
-        return return_obj
 
     @DocInherit
     @MetaPandasDataset.column_pair_map_expectation
